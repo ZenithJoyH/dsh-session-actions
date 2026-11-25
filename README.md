@@ -1,8 +1,8 @@
 # dsh-session-actions
 
-> 一个 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) Web 插件：侧栏会话行上的**操作集合**——标为未读、永久删除已归档会话。
+> 一个 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) Web 插件：侧栏会话行上的**操作集合**——标为未读、永久删除会话（无需先归档）。
 >
-> A DSH Web plugin that puts **session actions** in the sidebar row menu: mark unread, and permanently delete archived sessions.
+> A DSH Web plugin that puts **session actions** in the sidebar row menu: mark unread, and permanently delete any non-running session directly.
 
 原名 `dsh-archive-delete`；功能从“只删归档会话”扩展到“会话操作”后改为现名。旧版本的未读标记会自动迁移。
 
@@ -10,7 +10,7 @@
 
 DSH 的官方设计是「会话只能归档，永不删除」：归档只是把会话从列表里隐藏，日志仍然占着磁盘，也仍然能被搜索到。`dsh-session-actions` 补上这一个缺口：
 
-- 只有**已归档**的会话才会出现「永久删除…」菜单项；
+- 任意会话的「⋯」菜单都有「永久删除会话…」，**不需要先归档**；
 - 只允许删除**没有在运行、没有其他写入者**的会话；
 - Host 端先删日志目录，再清理 Workspace 记账与归档集合；
 - 浏览器端弹出确认框，明确写出「不可撤销」。
@@ -22,7 +22,7 @@ DSH 的官方设计是「会话只能归档，永不删除」：归档只是把�
 | 功能 | 入口 | 作用范围 |
 |---|---|---|
 | 标为未读 / 标为已读 | 会话行「⋯」菜单 | 任意会话；行尾显示未读圆点 |
-| 永久删除… | 归档会话的「⋯」菜单 | 仅已归档、未在运行的会话 |
+| 永久删除会话… | 任意会话的「⋯」菜单 | 任意未在运行的会话，**无需先归档** |
 
 ### 关于「未读」
 
@@ -46,11 +46,11 @@ DSH 自带的未读状态只存在于浏览器内存：会话跑完一轮后变�
 
 ## 交互
 
-1. 在侧栏把某个会话归档（官方 Archive）；
-2. 把视图切到「全部对话」或「仅显示已归档」，找到这个归档行；
-3. 打开该行「⋯」菜单 → **永久删除…**；
-4. 确认弹窗里点 **永久删除**；
-5. 成功后会话日志目录被移除，归档集合与 Workspace 记账同步清理，该行消失。
+1. 在侧栏找到要删除的会话（普通会话或已归档会话都可以）；
+2. 打开该行「⋯」菜单 → **永久删除会话…**；
+3. 确认弹窗里点 **永久删除**；
+4. 成功后会话日志目录被移除，live Session、归档集合与 Workspace 记账同步清理，该行消失；
+5. 如果删的是当前打开的会话，界面会自动切到一个新会话。
 
 > 删除的是会话日志（`$DSH_HOME/sessions/...`）。会话里引用过的附件是内容寻址的共享文件，不会被删除；如果你需要连附件一起清理，应另行实现带引用计数的手动清理。
 
@@ -140,14 +140,14 @@ Host 路由 `POST /plugin/session-actions/delete`：
 - 复用 `ctx.connection.requestRejection()`：Host/Origin 围栏 + 浏览器会话认证，和官方 `/api` 同级；
 - 只接受 `POST`，请求体上限 64 KiB；
 - 只删除字符串 Session id，路径由后端同款 `projectKey` / `encodeSegment` 计算，并强制落在会话根目录内；
-- 调用 `sessionPersistence.open(id, 'write')` 抢占写所有权后才删除，避免与另一个进程并发写；
+- 正在跑的回合直接 `409 active` 拒绝；idle 驻留的 Agent 会先取消/quiesce，再删除；
+- 没有 live Agent 时调用 `sessionPersistence.open(id, 'write')` 抢占写所有权，避免与另一个进程并发写；
 - 删除日志目录成功后才清理 registry；两者之间失败时保留归档状态，重试可完成（幂等）；
 - 同一进程内对同一 Session 的删除串行化，双击不会并发执行。
 
 它**不会**：
 
-- 删除非归档会话（即使知道 id）；
-- 停止正在运行的会话再删除（请先停止/归档）；
+- 停止正在运行的会话再删除（请先停止）；
 - 删除工作区目录、附件、导出文件或 `session_projcache` 之外的任何缓存；
 - 提供批量「清空归档」按钮（当前版本按会话删除；如需批量可在此基础上扩展）。
 

@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-actions",
-  "version": "0.2.0",
-  "description": "DSH web plugin: mark sessions unread and permanently delete archived ones. DSH Web 插件：标记会话未读 + 永久删除已归档会话。",
+  "version": "0.3.0",
+  "description": "DSH web plugin: session actions in the sidebar—mark unread, delete any non-running session directly (no archiving required). DSH Web 插件：会话操作——标为未读，直接删除任意未运行会话。",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ZenithJoyH/dsh-session-actions.git"

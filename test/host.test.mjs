@@ -6,7 +6,7 @@ import { join } from 'node:path'
 
 import {
   __test,
-  deleteArchivedSession
+  deleteSession
 } from '../lib/index.js'
 
 const {
@@ -107,7 +107,7 @@ function makeScoped(overrides = {}) {
 
 {
   const scoped = makeScoped()
-  const result = await deleteArchivedSession(scoped, sessionId, {
+  const result = await deleteSession(scoped, sessionId, {
     sessionsRoot: sessions,
     dshHome: home
   })
@@ -119,13 +119,31 @@ function makeScoped(overrides = {}) {
   ])
 }
 
-// ── refuses a non-archived session ──────────────────────────────────────────
+// ── deletes a visible, non-archived session directly ────────────────────────
 
 {
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'stub')
   const scoped = makeScoped({ registry: { archivedSessionIds: [] } })
+  const result = await deleteSession(scoped, sessionId, {
+    sessionsRoot: sessions,
+    dshHome: home
+  })
+  assert.deepEqual(result, { sessionId, removed: true })
+  await assert.rejects(access(dir), /ENOENT/)
+}
+
+// ── rejects an unknown session id ──────────────────────────────────────────
+
+{
+  const scoped = makeScoped({
+    registry: { archivedSessionIds: [] },
+    persistence: { stat: async () => undefined },
+    sessions: undefined
+  })
   await assert.rejects(
-    deleteArchivedSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
-    (error) => error instanceof DeleteError && error.code === 'not-archived'
+    deleteSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
+    (error) => error instanceof DeleteError && error.code === 'not-found'
   )
 }
 
@@ -134,7 +152,7 @@ function makeScoped(overrides = {}) {
 {
   const scoped = makeScoped({ agents: { get: (id) => (id === sessionId ? { id, status: 'running' } : undefined) } })
   await assert.rejects(
-    deleteArchivedSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
+    deleteSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
     (error) => error instanceof DeleteError && error.code === 'active'
   )
 }
@@ -153,7 +171,7 @@ function makeScoped(overrides = {}) {
   }
   const agents = { get: (id) => (id === sessionId ? live : undefined) }
   const scoped = makeScoped({ agents })
-  const result = await deleteArchivedSession(scoped, sessionId, {
+  const result = await deleteSession(scoped, sessionId, {
     sessionsRoot: sessions,
     dshHome: home
   })
@@ -175,7 +193,7 @@ function makeScoped(overrides = {}) {
     [sessionId, { detach: () => { detached += 1; store.delete(sessionId) } }]
   ])
   const scoped = makeScoped({ sessions: { store } })
-  const result = await deleteArchivedSession(scoped, sessionId, {
+  const result = await deleteSession(scoped, sessionId, {
     sessionsRoot: sessions,
     dshHome: home
   })
@@ -191,7 +209,7 @@ function makeScoped(overrides = {}) {
   owned.name = 'SessionAlreadyOwnedError'
   const scoped = makeScoped({ persistence: { open: async () => Promise.reject(owned) } })
   await assert.rejects(
-    deleteArchivedSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
+    deleteSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
     (error) => error instanceof DeleteError && error.code === 'locked'
   )
 }
@@ -200,7 +218,7 @@ function makeScoped(overrides = {}) {
 
 {
   const scoped = makeScoped({ persistence: { stat: async () => undefined } })
-  const result = await deleteArchivedSession(scoped, sessionId, {
+  const result = await deleteSession(scoped, sessionId, {
     sessionsRoot: sessions,
     dshHome: home
   })
