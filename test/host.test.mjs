@@ -1,6 +1,6 @@
 // Host-half tests: run with `node test/host.test.mjs` (no DSH process needed).
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, access, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, access, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -202,16 +202,67 @@ function makeScoped(overrides = {}) {
   assert.equal(store.has(sessionId), false)
 }
 
-// ── refuses a session owned by another writer ───────────────────────────────
-
+// A rejected write claim leaves the live row, disk log and registry alone.
 {
-  const owned = new Error('owned')
-  owned.name = 'SessionAlreadyOwnedError'
-  const scoped = makeScoped({ persistence: { open: async () => Promise.reject(owned) } })
+  await mkdir(dir, { recursive: true })
+  const owned = Object.assign(new Error('owned'), { name: 'SessionAlreadyOwnedError' })
+  let detached = 0
+  const store = new Map([[sessionId, { detach: () => { detached += 1 } }]])
+  const scoped = makeScoped({
+    sessions: { store },
+    persistence: { open: async () => { throw owned } }
+  })
   await assert.rejects(
     deleteSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: home }),
-    (error) => error instanceof DeleteError && error.code === 'locked'
+    { status: 423, code: 'locked' }
   )
+  assert.equal(detached, 0)
+  assert.ok(store.has(sessionId))
+  assert.deepEqual(scoped.cleaned, [])
+  await access(dir)
+}
+
+// If the durable marker cannot be written, no log or registry state changes.
+{
+  const alternateHome = join(home, 'blocked-marker')
+  await mkdir(alternateHome)
+  await writeFile(join(alternateHome, 'storages'), 'not a directory')
+  const scoped = makeScoped()
+  await assert.rejects(
+    deleteSession(scoped, sessionId, { sessionsRoot: sessions, dshHome: alternateHome }),
+    { code: 'ENOTDIR' }
+  )
+  await access(dir)
+  assert.deepEqual(scoped.cleaned, [])
+}
+
+// A concurrent request cannot quiesce or detach the same session twice.
+{
+  const options = { sessionsRoot: sessions, dshHome: home }
+  let cancelled = 0
+  let detached = 0
+  let enterDispose
+  let finishDispose
+  const started = new Promise((resolve) => { enterDispose = resolve })
+  const release = new Promise((resolve) => { finishDispose = resolve })
+  const agent = {
+    status: 'idle',
+    cancel() { cancelled += 1 },
+    scope: { async dispose() { enterDispose(); await release } }
+  }
+  const store = new Map([[sessionId, { detach: () => { detached += 1 } }]])
+  const scoped = makeScoped({ agents: new Map([[sessionId, agent]]), sessions: { store } })
+  const first = deleteSession(scoped, sessionId, options)
+  await started
+  try {
+    await assert.rejects(deleteSession(scoped, sessionId, options), { status: 409, code: 'busy' })
+    assert.equal(cancelled, 1)
+    assert.equal(detached, 0)
+  } finally {
+    finishDispose()
+    await first
+  }
+  assert.equal(detached, 1)
 }
 
 // ── idempotent cleanup when the log is already gone ─────────────────────────
@@ -228,9 +279,6 @@ function makeScoped(overrides = {}) {
     ['unarchive', sessionId]
   ])
 }
-
-await rm(home, { recursive: true, force: true })
-console.log('host tests: ok')
 
 // ── HTTP surface ────────────────────────────────────────────────────────────
 
@@ -290,3 +338,76 @@ function mockResponse() {
   assert.equal(res.status, 200)
   assert.deepEqual(JSON.parse(res.body), { ok: true, sessionId, removed: true })
 }
+
+
+// A Workspace failure after log removal remains retryable without archive
+// membership, a live row, or even the original plugin module's memory.
+{
+  const options = { sessionsRoot: sessions, dshHome: home }
+  const pendingDir = join(home, 'storages', 'session_actions', 'pending-deletes')
+  const member = new Set([sessionId, 'other-session'])
+  let fail = true
+  const workspace = {
+    // Filtered views may omit the stale membership after the log is gone.
+    get sessionIds() { return [] },
+    async detachSession(id) {
+      assert.equal(id, sessionId)
+      if (fail) throw new Error('injected Workspace cleanup failure')
+      member.delete(id)
+    }
+  }
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'stub')
+  const persisted = {
+    async stat(id) {
+      assert.equal(id, sessionId)
+      try {
+        await access(join(dir, 'session.v4.jsonl.zstd'))
+        return { header: { id, cwd } }
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        return undefined
+      }
+    }
+  }
+  const services = () => makeScoped({
+    registry: { archivedSessionIds: [], list: () => [workspace] },
+    persistence: persisted
+  })
+  const scoped = services()
+  scoped.logger = { warn() {} }
+  const res1 = mockResponse()
+  await __test.makeHandler(scoped, options)(mockRequest('POST', { sessionId }), res1)
+  assert.equal(res1.status, 500)
+  await assert.rejects(access(dir), { code: 'ENOENT' })
+  assert.equal((await readdir(pendingDir)).length, 1)
+  assert.ok(member.has(sessionId))
+
+  fail = false
+  const { __test: freshHost } = await import('../lib/index.js?fresh-host')
+  const handler = freshHost.makeHandler(services(), options)
+  const res2 = mockResponse()
+  await handler(mockRequest('POST', { sessionId }), res2)
+  assert.equal(res2.status, 200)
+  assert.deepEqual(JSON.parse(res2.body), { ok: true, sessionId, removed: false })
+  assert.deepEqual([...member], ['other-session'])
+  assert.deepEqual(await readdir(pendingDir), [])
+
+  const res3 = mockResponse()
+  await handler(mockRequest('POST', { sessionId }), res3)
+  assert.equal(res3.status, 404)
+}
+
+// An invalid or missing ID cannot be coerced into deleting a string-named session.
+{
+  const handler = __test.makeHandler(makeScoped(), { sessionsRoot: sessions, dshHome: home })
+  for (const body of [null, {}, { sessionId: 42 }, { sessionId: '' }]) {
+    const res = mockResponse()
+    await handler(mockRequest('POST', body), res)
+    assert.equal(res.status, 400)
+    assert.equal(JSON.parse(res.body).code, 'bad-request')
+  }
+}
+
+await rm(home, { recursive: true, force: true })
+console.log('host tests: ok')

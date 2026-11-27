@@ -11,11 +11,11 @@
 DSH 的官方设计是「会话只能归档，永不删除」：归档只是把会话从列表里隐藏，日志仍然占着磁盘，也仍然能被搜索到。`dsh-session-actions` 补上这一个缺口：
 
 - 任意会话的「⋯」菜单都有「永久删除会话…」，**不需要先归档**；
-- 只允许删除**没有在运行、没有其他写入者**的会话；
-- Host 端先删日志目录，再清理 Workspace 记账与归档集合；
+- 运行中的会话不允许删除；对没有驻留 Agent 的会话，Host 会先检查写锁；
+- Host 端先记录待清理状态，再删除日志目录、清理 Workspace 记账与归档集合；
 - 浏览器端弹出确认框，明确写出「不可撤销」。
 
-它不删除可见会话、不删除工作区、不删除附件等共享文件。
+它可以删除普通、置顶或已归档的会话，但不会删除工作区目录、附件等共享文件。
 
 ## 两个功能
 
@@ -36,10 +36,10 @@ DSH 自带的未读状态只存在于浏览器内存：会话跑完一轮后变�
 ## 特性
 
 - 🔵 **未读标记**：「⋯」→「标为未读」，行尾出现圆点，刷新后仍保留；打开会话即恢复已读；
-- 🗑 **归档行专属入口**：在「⋯」菜单里新增一行「永久删除…」，普通会话与置顶会话看不到；
-- 🛡 **Host 端双重准入**：会话必须在归档集合中、且没有 live Agent / 其他写锁，否则拒绝；
+- 🗑 **会话行删除入口**：普通、置顶、已归档会话的「⋯」菜单都可发起永久删除；
+- 🛡 **Host 端检查**：正在运行的会话直接拒绝；没有驻留 Agent 时，Host 会检查已持久化会话的写所有权；
 - 🪟 **真正的确认弹窗**：显示会话标题与不可撤销警告，失败时就地显示原因；
-- 🔁 **幂等清理**：日志已不存在但归档记账还在时，重试只做清理，不报错；
+- 🔁 **可重试清理**：删除未完成时保留磁盘标记；即使普通会话的日志已删除，也能用同一会话 ID 继续清理；
 - 🌏 中英双语文案，跟随 dsh 语言设置；
 - 🎨 使用 dsh 主题 token，明暗主题自动适配；
 - 📦 无构建步骤，Host 半零第三方依赖。
@@ -127,7 +127,7 @@ Host 侧可选配置（写在 `cordis.patch.yml` 的条目下）：
         route: /plugin/session-actions/delete
         # 覆盖 JSONL 会话根目录；默认 $DSH_HOME/sessions
         sessionsRoot: /Users/me/.dsh/sessions
-        # 覆盖用于清理投影缓存文件的 dsh home；默认 $DSH_HOME 或 ~/.dsh
+        # 覆盖待清理标记和投影缓存的 dsh home；默认 $DSH_HOME 或 ~/.dsh
         dshHome: /Users/me/.dsh
 ```
 
@@ -141,9 +141,9 @@ Host 路由 `POST /plugin/session-actions/delete`：
 - 只接受 `POST`，请求体上限 64 KiB；
 - 只删除字符串 Session id，路径由后端同款 `projectKey` / `encodeSegment` 计算，并强制落在会话根目录内；
 - 正在跑的回合直接 `409 active` 拒绝；idle 驻留的 Agent 会先取消/quiesce，再删除；
-- 没有 live Agent 时调用 `sessionPersistence.open(id, 'write')` 抢占写所有权，避免与另一个进程并发写；
-- 删除日志目录成功后才清理 registry；两者之间失败时保留归档状态，重试可完成（幂等）；
-- 同一进程内对同一 Session 的删除串行化，双击不会并发执行。
+- 没有驻留 Agent 时，通过 `sessionPersistence.open(id, 'write')` 检查写所有权；已有其他写入者时返回 `423 locked`。这是准入检查，不是跨进程删除事务；
+- 待清理标记写入 `$DSH_HOME/storages/session_actions/pending-deletes/`，待日志和 registry 都清理后再移除；失败可在确认框重试，也可在 Host 重启后对原会话 ID 重试，不会在启动时自动删除；
+- 同一进程内，同一存储根目录和会话 ID 只允许一个删除请求执行；并发请求在修改 Agent 或会话状态前返回 `409 busy`。
 
 它**不会**：
 
@@ -164,15 +164,15 @@ npm test
 测试覆盖：
 
 - 与官方 JSONL 后端一致的 `projectKey` / `encodeSegment`；
-- 正常删除、非归档拒绝、运行中拒绝、写锁拒绝；
-- 日志已丢失时的幂等清理；
+- 普通会话和已归档会话删除、运行中拒绝、写锁拒绝及并发拒绝；
+- 日志已删除后的 Workspace 失败重试，以及从磁盘恢复待清理状态；
 - 浏览器 bundle 的加载、pending 状态机、成功/失败请求路径。
 
 ## 实现说明
 
-- Host 半 `lib/index.js`：`ctx.inject(['webServer', 'connection', 'workspaceRegistry'])` 后注册一条 exact 路由；核心操作 `deleteArchivedSession()` 可单独测试。
+- Host 半 `lib/index.js`：`ctx.inject(['webServer', 'connection', 'workspaceRegistry'])` 后注册一条 exact 路由；核心操作 `deleteSession()` 可单独测试。
 - Client 半 `lib/client.js`：手写 dsh client-bundle 格式，注册两个 slot：
-  - `sidebar.workspaces.session.menu.item`（order 500，官方 `session-id` 之后）——仅归档行可见；
+  - `sidebar.workspaces.session.menu.item`（order 500，官方 `session-id` 之后）——普通、置顶、归档行均可见；
   - `shell.overlay`（order 900）——确认弹窗。
 - 删除后的列表更新来自 Host 的 Workspace follow 流：`detachSession` + `unarchiveSession` 会推送 Workspace/归档增量，侧栏自然移除该行。
 
